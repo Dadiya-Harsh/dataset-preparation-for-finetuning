@@ -635,7 +635,7 @@ def main():
     parser.add_argument("--github-query", type=str, default="language:python machine learning", 
                         help="GitHub search query")
     parser.add_argument("--max-repos", type=int, default=10, help="Maximum repositories to process")
-    parser.add_argument("--files-per-repo", type=int, default=5, 
+    parser.add_argument("--files-per-repo", type=int, default=50, 
                         help="Maximum files per repository")
     parser.add_argument("--kaggle-keywords", type=str, default="machine learning, data science",
                         help="Comma-separated Kaggle search keywords")
