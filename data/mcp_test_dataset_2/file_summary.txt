@@ -1,0 +1,25 @@
+Repository: Dadiya-Harsh-wappnet/MCP-DEMO
+Total files processed: 20
+Examples collected: 15
+
+Files processed:
+- browser_documentation.py
+- learning/Clients/multi_server_mcp_client.py
+- learning/Servers/async_postgres_server.py
+- learning/Servers/enhanced_folder_server.py
+- learning/Servers/folder_server.py
+- learning/Servers/postgres_server.py
+- learning/Servers/web_search_using_tavily.py
+- learning/annotations/type_dict_ex.py
+- learning/asyncoronus python/TaskGroup_usage.py
+- learning/asyncoronus python/async_1.py
+- learning/asyncoronus python/await_1.py
+- learning/asyncoronus python/couroutine_seprately.py
+- learning/asyncoronus python/create_task.py
+- learning/asyncoronus python/gather_task.py
+- learning/groq/server.py
+- learning/groq/simple_async_groq_client.py
+- learning/groq/simple_groq_client.py
+- learning/groq/simple_sse_client.py
+- learning/groq/tool_usage_example.py
+- learning/langgraph/agent.py

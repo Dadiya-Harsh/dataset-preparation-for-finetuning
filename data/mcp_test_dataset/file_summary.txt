@@ -1,0 +1,11 @@
+Repository: Dadiya-Harsh/mcp-server-suite
+Total files processed: 6
+Examples collected: 3
+
+Files processed:
+- database/postgresql/async_postgressql_server.py
+- database/postgresql/sync_postgressql_server.py
+- file explore/basic_file_server.py
+- main.py
+- web search/web_search_stdio.py
+- web search/web_serach_sse.py
