@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "beautifulsoup4>=4.13.4",
+    "firecrawl-py>=2.5.3",
     "pygithub>=2.6.1",
+    "ratelimit>=2.2.1",
     "requests>=2.32.3",
     "tqdm>=4.67.1",
 ]
