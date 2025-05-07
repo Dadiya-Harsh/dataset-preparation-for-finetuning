@@ -5,7 +5,7 @@ GitHub and Online Documentation Data Collector for Code Fine-tuning
 This script helps collect and format code examples from GitHub repositories,
 Kaggle notebooks, and online documentation for fine-tuning code models.
 
-It uses Ollama to dynamically generate instructions for code examples.
+It uses Ollama to dynamically generate meaningful, task-oriented instructions for code examples.
 """
 
 import os
@@ -57,7 +57,8 @@ class DataCollector:
         
     def generate_instruction_with_ollama(self, code, language, repo=None, file_path=None, metadata=None):
         """
-        Generate an instruction for code using Ollama LLM.
+        Generate a meaningful, task-oriented instruction for code using Ollama LLM.
+        Processes the full code, splitting into chunks if necessary to handle large files.
         
         Args:
             code: The code content to generate an instruction for
@@ -70,95 +71,293 @@ class DataCollector:
             Generated instruction or None if generation failed
         """
         try:
-            # Create a context-rich prompt for the LLM
+            # Build comprehensive context
             context = []
+            
+            # Add repository context if available
             if repo and file_path:
                 context.append(f"File: {file_path}")
                 context.append(f"Repository: {repo.full_name}")
-                context.append(f"Repository description: {repo.description}")
                 
+                if repo.description:
+                    context.append(f"Repository description: {repo.description}")
+                
+                # Try to get repo topics for more context
+                try:
+                    topics = repo.get_topics()
+                    if topics:
+                        context.append(f"Repository topics: {', '.join(topics)}")
+                except:
+                    pass
+                
+                # Get project structure summary
+                try:
+                    dir_path = os.path.dirname(file_path)
+                    dir_contents = repo.get_contents(dir_path)
+                    related_files = [os.path.basename(item.path) for item in dir_contents if item.type == "file"]
+                    if related_files:
+                        context.append(f"Related files in directory: {', '.join(related_files[:10])}")
+                        
+                    # Try to get README content for additional context
+                    try:
+                        readme_content = None
+                        for item in dir_contents:
+                            if item.name.lower() == 'readme.md':
+                                readme_content = item.decoded_content.decode('utf-8', errors='replace')
+                                break
+                        
+                        if readme_content:
+                            # Extract first few paragraphs from README
+                            readme_intro = '\n'.join(readme_content.split('\n\n')[:3])
+                            if readme_intro:
+                                context.append(f"Project README excerpt: {readme_intro}")
+                    except:
+                        pass
+                except:
+                    pass
+                    
             if metadata:
                 for key, value in metadata.items():
                     if key not in ['source', 'language'] and value:
                         context.append(f"{key}: {value}")
             
-            # Truncate code if it's too large to avoid token limits
-            code_preview = code[:5000] + "..." if len(code) > 5000 else code
+            # Process full code by splitting into manageable chunks if needed
+            MAX_CHUNK_SIZE = 4000  # Characters per chunk
+            full_code_length = len(code)
             
-            prompt = f"""You are an expert at creating high-quality code instruction-response pairs for fine-tuning LLMs.
+            # If code is small enough, send it in one request
+            if full_code_length <= MAX_CHUNK_SIZE:
+                return self._generate_instruction_single(code, language, context)
+            
+            # For larger code, process in multiple stages
+            else:
+                print(f"Code is large ({full_code_length} chars), processing in multiple chunks...")
+                return self._generate_instruction_multi_chunk(code, language, context)
+        
+        except Exception as e:
+            print(f"Error generating instruction with Ollama: {str(e)}")
+            print(traceback.format_exc())
+            return self._generate_fallback_instruction(code, language, repo, file_path)
+            
+    def _generate_instruction_single(self, code, language, context):
+        """Generate instruction with full code in a single request"""
+        
+        # Create prompt that emphasizes practical, project-focused instructions
+        prompt = f"""You are an expert at creating high-quality code instruction-response pairs for fine-tuning LLMs.
 
-Given the following {language} code, write a clear, specific instruction that would prompt someone to write this exact code.
-The instruction should be detailed enough that the code would be a perfect response to it.
+Given the following {language} code, create a SPECIFIC, PRACTICAL instruction that would prompt someone to write this code.
 
-Context:
+The instruction should:
+1. Describe a REALISTIC PROJECT or TASK that would require writing this code
+2. Include specific requirements, functionality details and purpose
+3. Mention tools, libraries, and approaches that should be used
+4. Be focused on the PURPOSE of the code, not just its structure
+5. NOT be generic like "write a Python function" or "create a class"
+6. NOT contain actual function/class names from the original code
+
+Context information:
 {chr(10).join(context)}
 
 Code:
 ```{language.lower()}
-{code_preview}
+{code}
 ```
 
-Your task: Write a clear instruction (prompt) that would lead someone to write this code. 
-Be specific about functionality, purpose, and requirements. Don't repeat the code itself in the instruction.
+Your task: Write a specific, detailed project-oriented instruction that would lead someone to write this exact code.
 Respond with ONLY the instruction text, nothing else."""
 
-            # Make API call to Ollama
+        # Make API call to Ollama
+        response = requests.post(
+            f"{self.ollama_url}/api/generate",
+            json={
+                "model": self.ollama_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "max_tokens": 500
+                }
+            }
+        )
+        
+        if response.status_code != 200:
+            print(f"Ollama API error: {response.status_code} - {response.text}")
+            return self._generate_fallback_instruction(code, language, None, None)
+            
+        result = response.json()
+        instruction = result.get("response", "").strip()
+        
+        # Fallback if instruction is too short
+        if len(instruction) < 30:
+            print("LLM generated instruction was too short, using fallback.")
+            return self._generate_fallback_instruction(code, language, None, None)
+            
+        return instruction
+
+    def _generate_instruction_multi_chunk(self, code, language, context):
+        """Process large code files in multiple steps"""
+        
+        # Step 1: Split code into manageable chunks
+        MAX_CHUNK_SIZE = 4000
+        code_chunks = []
+        total_length = len(code)
+        
+        # Create reasonably-sized chunks, trying to split at meaningful boundaries
+        chunk_start = 0
+        while chunk_start < total_length:
+            chunk_end = min(chunk_start + MAX_CHUNK_SIZE, total_length)
+            
+            # Try to find a good breaking point (newline) if not at the end
+            if chunk_end < total_length:
+                # Look for a newline within the last 200 chars of the chunk
+                for i in range(chunk_end, max(chunk_start, chunk_end - 200), -1):
+                    if code[i] == '\n':
+                        chunk_end = i + 1
+                        break
+            
+            code_chunks.append(code[chunk_start:chunk_end])
+            chunk_start = chunk_end
+        
+        print(f"Split code into {len(code_chunks)} chunks")
+        
+        # Step 2: First pass - analyze each chunk to extract key information 
+        chunk_analyses = []
+        
+        for i, chunk in enumerate(code_chunks):
+            analysis_prompt = f"""You are analyzing a chunk of {language} code (chunk {i+1} of {len(code_chunks)}).
+Extract the key components, functionality, and purpose of this code chunk.
+Be concise but specific. Focus on identifying:
+1. Main classes/functions and their purposes
+2. Libraries/frameworks used
+3. Core functionality implemented
+4. Data structures or algorithms used
+
+Code chunk:
+```{language.lower()}
+{chunk}
+```
+
+Respond with ONLY a concise analysis (3-5 sentences maximum)."""
+
+            try:
+                response = requests.post(
+                    f"{self.ollama_url}/api/generate",
+                    json={
+                        "model": self.ollama_model,
+                        "prompt": analysis_prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.3,
+                            "max_tokens": 200
+                        }
+                    }
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    chunk_analyses.append(result.get("response", "").strip())
+                else:
+                    chunk_analyses.append(f"Chunk {i+1}: Analysis failed")
+                    
+            except Exception as e:
+                print(f"Error analyzing chunk {i+1}: {str(e)}")
+                chunk_analyses.append(f"Chunk {i+1}: Analysis error")
+                
+            # Be nice to the API
+            time.sleep(1)
+        
+        # Step 3: Generate final instruction based on all chunk analyses
+        final_prompt = f"""You are creating a specific coding project instruction based on analyzed code.
+
+The code being analyzed is written in {language} and consists of multiple parts.
+Here's what each part of the code contains:
+
+{chr(10).join(chunk_analyses)}
+
+Additional context:
+{chr(10).join(context)}
+
+Based on this comprehensive analysis, create a SPECIFIC, PRACTICAL project instruction that would prompt someone to write this exact code.
+
+The instruction should:
+1. Describe a REALISTIC PROJECT that would require writing this code
+2. Include specific requirements, functionality details and purpose
+3. Mention necessary tools, libraries, and frameworks
+4. NOT be generic like "write a Python script" or "create a class"
+5. NOT contain the actual class/function names from the original code
+6. Focus on the overall PURPOSE and functionality
+
+Respond with ONLY the project instruction, nothing else."""
+
+        try:
             response = requests.post(
                 f"{self.ollama_url}/api/generate",
                 json={
                     "model": self.ollama_model,
-                    "prompt": prompt,
+                    "prompt": final_prompt,
                     "stream": False,
                     "options": {
                         "temperature": 0.7,
-                        "top_p": 0.9,
                         "max_tokens": 500
                     }
                 }
             )
             
-            if response.status_code != 200:
-                print(f"Ollama API error: {response.status_code} - {response.text}")
-                return self._generate_fallback_instruction(code, language, repo, file_path)
+            if response.status_code == 200:
+                result = response.json()
+                instruction = result.get("response", "").strip()
                 
-            result = response.json()
-            instruction = result.get("response", "").strip()
-            
-            # Fallback to rule-based if the LLM output is too short or empty
-            if len(instruction) < 20:
-                print("LLM generated instruction was too short, using fallback.")
-                return self._generate_fallback_instruction(code, language, repo, file_path)
+                # Validate instruction quality
+                if len(instruction) < 30:
+                    print("Generated instruction was too short, using fallback.")
+                    return self._generate_fallback_instruction(code, language, None, None)
+                    
+                return instruction
+            else:
+                print(f"Final instruction generation failed: {response.status_code}")
+                return self._generate_fallback_instruction(code, language, None, None)
                 
-            return instruction
-            
         except Exception as e:
-            print(f"Error generating instruction with Ollama: {str(e)}")
-            print(traceback.format_exc())
-            return self._generate_fallback_instruction(code, language, repo, file_path)
-    
+            print(f"Error generating final instruction: {str(e)}")
+            return self._generate_fallback_instruction(code, language, None, None)
+                
     def _generate_fallback_instruction(self, code, language, repo=None, file_path=None):
-        """Legacy rule-based instruction generator as fallback"""
-        description = f"Implement {language} code"
+        """
+        Enhanced fallback instruction generator when LLM generation fails
+        Uses code analysis to create more meaningful instructions
+        """
+        description = f"Implement a {language} project"
         
         # Extract function/class names
         if language == "Python":
             functions = re.findall(r'def\s+([a-zA-Z0-9_]+)\s*\(', code)
             classes = re.findall(r'class\s+([a-zA-Z0-9_]+)\s*[:\(]', code)
+            # Extract imports for libraries
+            imports = re.findall(r'import\s+([a-zA-Z0-9_.,\s]+)', code)
+            imports += re.findall(r'from\s+([a-zA-Z0-9_.]+)\s+import', code)
         elif language in ["JavaScript", "TypeScript"]:
             functions = re.findall(r'function\s+([a-zA-Z0-9_]+)\s*\(', code)
             classes = re.findall(r'class\s+([a-zA-Z0-9_]+)\s*[{\(]', code)
+            # Extract imports/requires
+            imports = re.findall(r'import\s+.*?from\s+[\'"]([a-zA-Z0-9_./\\-]+)[\'"]', code)
+            imports += re.findall(r'require\([\'"]([a-zA-Z0-9_./\\-]+)[\'"]\)', code)
         elif language == "Java":
             functions = re.findall(r'(?:public|private|protected|static|\s) +[\w\<\>\[\]]+\s+(\w+) *\([^\)]*\)', code)
             classes = re.findall(r'class\s+([a-zA-Z0-9_]+)\s*[{\(]', code)
+            # Extract imports
+            imports = re.findall(r'import\s+([a-zA-Z0-9_.]+);', code)
         else:
             functions = []
             classes = []
+            imports = []
             
-        # Extract comments to understand purpose
+        # Extract docstrings and comments for understanding purpose
         comments = []
         if language == "Python":
-            # Extract docstrings
+            # Extract docstrings (multi-line and single line)
             docstrings = re.findall(r'"""(.+?)"""', code, re.DOTALL)
+            docstrings += re.findall(r"'''(.+?)'''", code, re.DOTALL)
             comments = re.findall(r'#\s*(.+)$', code, re.MULTILINE) + docstrings
         elif language in ["JavaScript", "TypeScript", "Java", "C++", "C", "PHP"]:
             comments = re.findall(r'//\s*(.+)$', code, re.MULTILINE)
@@ -166,30 +365,78 @@ Respond with ONLY the instruction text, nothing else."""
             multiline = re.findall(r'/\*(.+?)\*/', code, re.DOTALL)
             comments.extend(multiline)
             
-        # Build description based on available information
+        # Extract file description from top comments/docstrings
+        file_purpose = None
+        if comments:
+            # Check for file header docstring/comment
+            top_comments = [c.strip() for c in comments[:3]]
+            for comment in top_comments:
+                if len(comment) > 30 and "import" not in comment.lower() and "copyright" not in comment.lower():
+                    file_purpose = comment
+                    break
+        
+        # Build more detailed description based on available information
+        project_type = "tool" if "cli" in code.lower() or "argparse" in code.lower() else "library"
+        
         if repo and file_path:
             file_name = os.path.basename(file_path)
-            description = f"Implement {language} code for a file named '{file_name}' from the '{repo.name}' repository"
+            description = f"Develop a {language} {project_type} named '{file_name}'"
             
-        if classes:
-            class_list = ", ".join(classes[:3])
-            if len(classes) > 3:
-                class_list += ", etc."
-            description += f" that defines {class_list} class{'es' if len(classes) > 1 else ''}"
+            if repo.description:
+                description += f" for {repo.description}"
+        
+        # Add main functionality description
+        if file_purpose:
+            description += f" that {file_purpose}"
+        elif classes and functions:
+            # Identify main classes and functions
+            main_components = []
+            if len(classes) > 0:
+                class_list = ", ".join(classes[:3])
+                if len(classes) > 3:
+                    class_list += ", and others"
+                main_components.append(f"implements the {class_list} class{'es' if len(classes) > 1 else ''}")
                 
-        if functions and not "that defines" in description:
-            func_list = ", ".join(functions[:3])
-            if len(functions) > 3:
-                func_list += ", etc."
-            description += f" that implements {func_list} function{'s' if len(functions) > 1 else ''}"
+            if len(functions) > 0:
+                func_list = ", ".join(functions[:3])
+                if len(functions) > 3:
+                    func_list += ", and others"
+                main_components.append(f"provides {func_list} function{'s' if len(functions) > 1 else ''}")
                 
-        # Add some context from comments if available
-        if comments:
-            # Get the first non-empty comment that's reasonably sized
-            informative_comments = [c.strip() for c in comments if len(c.strip()) > 10 and len(c.strip()) < 100]
-            if informative_comments:
-                description += f". The code {informative_comments[0]}"
+            if main_components:
+                description += f" that {' and '.join(main_components)}"
+        
+        # Add important libraries/frameworks
+        if imports:
+            # Clean up imports
+            cleaned_imports = []
+            for imp in imports:
+                # Split multi-imports
+                for part in re.split(r'[,\s]+', imp):
+                    part = part.strip()
+                    if part and not part.startswith('.') and len(part) > 1:
+                        # Get the base package
+                        base_pkg = part.split('.')[0]
+                        if base_pkg not in cleaned_imports and not base_pkg.startswith('_'):
+                            cleaned_imports.append(base_pkg)
+            
+            if cleaned_imports:
+                top_libs = cleaned_imports[:5]
+                lib_text = ", ".join(top_libs)
+                if len(cleaned_imports) > 5:
+                    lib_text += ", and other libraries"
+                description += f". The solution should use {lib_text}"
                 
+        # Add purpose from comments if available
+        if comments and not file_purpose:
+            # Find a comment that seems to describe functionality
+            for comment in comments:
+                comment = comment.strip()
+                if len(comment) > 25 and len(comment) < 150:
+                    if any(word in comment.lower() for word in ['implement', 'create', 'provide', 'generate', 'class', 'function', 'tool']):
+                        description += f". The code should {comment}"
+                        break
+        
         return description
     
     def collect_from_github(self, query, max_repos=10, files_per_repo=5, min_stars=100):
@@ -259,20 +506,44 @@ Respond with ONLY the instruction text, nothing else."""
         print(f"Collected {len(examples)} examples from GitHub")
         return examples
     
-    def _get_repo_contents(self, repo, path=""):
-        """Recursively get repository contents"""
+    def _get_repo_contents(self, repo, path="", max_depth=3, current_depth=0):
+        """
+        Recursively get repository contents with depth limit
+        
+        Args:
+            repo: GitHub repository object
+            path: Current path to get contents for
+            max_depth: Maximum directory depth to recurse into
+            current_depth: Current recursion depth
+        """
         contents = []
         
-        # Get contents of the current path
-        items = repo.get_contents(path)
-        
-        for item in items:
-            if item.type == "dir":
-                # Recursively get directory contents
-                contents.extend(self._get_repo_contents(repo, item.path))
-            else:
-                contents.append(item)
-                
+        if current_depth > max_depth:
+            return contents
+            
+        try:
+            # Get contents of the current path
+            items = repo.get_contents(path)
+            
+            for item in items:
+                if item.type == "dir":
+                    # Skip common directories we want to avoid
+                    if any(skip in item.path.lower() for skip in [
+                        'test', 'docs', 'example', 'vendor', 'node_modules', 
+                        '.git', 'build', 'dist', '__pycache__'
+                    ]):
+                        continue
+                        
+                    # Recursively get directory contents with depth limit
+                    if current_depth < max_depth:
+                        contents.extend(self._get_repo_contents(
+                            repo, item.path, max_depth, current_depth + 1
+                        ))
+                else:
+                    contents.append(item)
+        except Exception as e:
+            print(f"Error getting repo contents for path {path}: {str(e)}")
+                    
         return contents
     
     def _is_code_file(self, path):
@@ -282,11 +553,18 @@ Respond with ONLY the instruction text, nothing else."""
     def _process_github_file(self, repo, file):
         """Process a GitHub file and create an example"""
         try:
+            # Skip files with unwanted names
+            file_basename = os.path.basename(file.path).lower()
+            if any(skip in file_basename for skip in [
+                'test', 'setup.py', '__init__.py', 'config', 'utils', 'helper'
+            ]) and file.size < 1000:  # Allow larger util files that might be substantive
+                return None
+                
             # Get file content
             content = file.decoded_content.decode('utf-8', errors='replace')
             
-            # Skip if file is too large or too small
-            if len(content) > 10000 or len(content) < 100:
+            # Skip if file is too small or suspicious size
+            if len(content) < 200:
                 return None
                 
             # Extract extension and determine language
@@ -294,6 +572,16 @@ Respond with ONLY the instruction text, nothing else."""
             language = self.lang_extensions.get(ext)
             
             if not language:
+                return None
+                
+            # Quality checks to ensure the file is worth processing
+            lines = content.count('\n')
+            if lines < 15:  # Skip very small files
+                return None
+                
+            # Check for code density (code vs whitespace/comments)
+            non_empty_lines = sum(1 for line in content.splitlines() if line.strip())
+            if non_empty_lines < 10:
                 return None
                 
             # Generate instruction using Ollama LLM
@@ -304,17 +592,23 @@ Respond with ONLY the instruction text, nothing else."""
                 file_path=file.path
             )
             
-            return {
-                "prompt": f"### Instruction:\n{instruction}\n\n### Response:",
-                "response": content,
-                "metadata": {
-                    "source": "github",
-                    "repo": repo.full_name,
-                    "path": file.path,
-                    "language": language,
-                    "stars": repo.stargazers_count
+            # Only create examples with substantive instructions
+            if instruction and len(instruction) > 30:
+                return {
+                    "prompt": f"### Instruction:\n{instruction}\n\n### Response:",
+                    "response": content,
+                    "metadata": {
+                        "source": "github",
+                        "repo": repo.full_name,
+                        "path": file.path,
+                        "language": language,
+                        "stars": repo.stargazers_count,
+                        "file_size": file.size,
+                        "line_count": lines
+                    }
                 }
-            }
+            else:
+                return None
             
         except Exception as e:
             print(f"Error processing file {file.path}: {str(e)}")
@@ -323,7 +617,6 @@ Respond with ONLY the instruction text, nothing else."""
     def collect_from_kaggle(self, keywords, max_notebooks=20):
         """
         Collect code examples from Kaggle notebooks using web scraping.
-        Note: This is a simplified implementation and might need adjustments.
         
         Args:
             keywords: List of search keywords
@@ -334,7 +627,7 @@ Respond with ONLY the instruction text, nothing else."""
         
         for keyword in keywords:
             try:
-                # Search for notebooks (simplified)
+                # Search for notebooks
                 url = f"https://www.kaggle.com/code?searchQuery={keyword}"
                 response = requests.get(url, headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -368,6 +661,10 @@ Respond with ONLY the instruction text, nothing else."""
                             
                         nb_soup = BeautifulSoup(nb_response.text, 'html.parser')
                         
+                        # Try to extract notebook title/description for context
+                        notebook_title = nb_soup.find('h1', class_='notebook-title')
+                        title_text = notebook_title.get_text().strip() if notebook_title else ""
+                        
                         # Extract code cells (this will need adaptation)
                         code_cells = nb_soup.find_all('div', class_='source-code')
                         
@@ -375,9 +672,13 @@ Respond with ONLY the instruction text, nothing else."""
                             code = cell.get_text()
                             
                             # Skip small code cells
-                            if len(code) < 50:
+                            if len(code) < 200 or code.count('\n') < 10:
                                 continue
                                 
+                            # Get surrounding text for context
+                            prev_markdown = cell.find_previous('div', class_='markdown-cell')
+                            context_text = prev_markdown.get_text().strip() if prev_markdown else ""
+                            
                             # Generate instruction using Ollama
                             instruction = self.generate_instruction_with_ollama(
                                 code=code,
@@ -385,26 +686,30 @@ Respond with ONLY the instruction text, nothing else."""
                                 metadata={
                                     "source": "kaggle",
                                     "url": link,
-                                    "keyword": keyword
+                                    "keyword": keyword,
+                                    "notebook_title": title_text,
+                                    "context": context_text[:300] if context_text else ""
                                 }
                             )
                             
-                            example = {
-                                "prompt": f"### Instruction:\n{instruction}\n\n### Response:",
-                                "response": code,
-                                "metadata": {
-                                    "source": "kaggle",
-                                    "url": link,
-                                    "keyword": keyword
+                            if instruction and len(instruction) > 30:
+                                example = {
+                                    "prompt": f"### Instruction:\n{instruction}\n\n### Response:",
+                                    "response": code,
+                                    "metadata": {
+                                        "source": "kaggle",
+                                        "url": link,
+                                        "keyword": keyword,
+                                        "notebook_title": title_text
+                                    }
                                 }
-                            }
-                            
-                            examples.append(example)
-                            
-                            # Write example to JSONL file
-                            with open(self.jsonl_path, "a", encoding="utf-8") as f:
-                                f.write(json.dumps(example) + "\n")
                                 
+                                examples.append(example)
+                                
+                                # Write example to JSONL file
+                                with open(self.jsonl_path, "a", encoding="utf-8") as f:
+                                    f.write(json.dumps(example) + "\n")
+                                    
                     except Exception as e:
                         print(f"Error processing notebook {link}: {str(e)}")
                         
@@ -429,14 +734,12 @@ Respond with ONLY the instruction text, nothing else."""
         print("Collecting from documentation...")
         
         selectors = selectors or {
-            # Default selectors for common documentation sites
             "docs.python.org": "pre.python",
             "developer.mozilla.org": "pre.brush",
             "docs.microsoft.com": "pre code",
             "docs.aws.amazon.com": "pre.programlisting",
             "docs.docker.com": "pre code",
-            "kubernetes.io": "pre.language-yaml, pre.language-bash",
-            # Add more as needed
+            "kubernetes.io": "pre.language-yaml, pre.language-bash"
         }
         
         for url in urls:
@@ -458,48 +761,71 @@ Respond with ONLY the instruction text, nothing else."""
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
                 # Extract title
-                title = soup.title.string if soup.title else "Documentation Example"
+                title = soup.title.string.strip() if soup.title else "Documentation Example"
+                
+                # Try to extract page context (heading and surrounding text)
+                main_content = soup.find('main') or soup.find('article') or soup.find('div', class_='content')
+                page_context = ""
+                if main_content:
+                    headings = main_content.find_all(['h1', 'h2', 'h3'])
+                    if headings:
+                        page_context = headings[0].get_text().strip()
+                        # Get first paragraph after heading
+                        next_p = headings[0].find_next('p')
+                        if next_p:
+                            page_context += " - " + next_p.get_text().strip()[:200]
                 
                 # Extract code blocks
                 code_blocks = soup.select(selector)
                 
                 for i, block in enumerate(code_blocks):
-                    code = block.get_text()
+                    code = block.get_text().strip()
                     
                     # Skip small code blocks
-                    if len(code) < 50:
+                    if len(code) < 200 or code.count('\n') < 10:
                         continue
                         
                     # Try to determine language based on classes or parent classes
                     language = self._detect_language_from_html(block)
+                    if not language:
+                        language = "Unknown"
+                    
+                    # Get surrounding text for context
+                    prev_p = block.find_previous('p')
+                    context_text = prev_p.get_text().strip()[:300] if prev_p else ""
                     
                     # Generate instruction using Ollama
                     instruction = self.generate_instruction_with_ollama(
                         code=code,
-                        language=language if language else "Unknown",
+                        language=language,
                         metadata={
                             "source": "documentation",
                             "url": url,
-                            "title": title
+                            "title": title,
+                            "context": context_text,
+                            "page_context": page_context
                         }
                     )
                     
-                    example = {
-                        "prompt": f"### Instruction:\n{instruction}\n\n### Response:",
-                        "response": code,
-                        "metadata": {
-                            "source": "documentation",
-                            "url": url,
-                            "title": title,
-                            "language": language
+                    if instruction and len(instruction) > 30:
+                        example = {
+                            "prompt": f"### Instruction:\n{instruction}\n\n### Response:",
+                            "response": code,
+                            "metadata": {
+                                "source": "documentation",
+                                "url": url,
+                                "title": title,
+                                "language": language,
+                                "context": context_text,
+                                "page_context": page_context
+                            }
                         }
-                    }
-                    
-                    examples.append(example)
-                    
-                    # Write example to JSONL file
-                    with open(self.jsonl_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(example) + "\n")
+                        
+                        examples.append(example)
+                        
+                        # Write example to JSONL file
+                        with open(self.jsonl_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(example) + "\n")
                 
                 # Sleep to be nice to the server
                 time.sleep(2)
