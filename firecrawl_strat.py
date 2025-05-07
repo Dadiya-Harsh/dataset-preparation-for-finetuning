@@ -7,7 +7,7 @@ import requests
 
 load_dotenv()
 
-def generate_instruction(response_text: str, model: str = "llama3.2") -> Optional[str]:
+def generate_instruction(response_text: str, model: str = "deepseek-r1:1.5b") -> Optional[str]: # change model to use resources efficiently
     """
     Generates an instruction from the given content using an Ollama model.
 
@@ -44,7 +44,7 @@ Content to generate instruction for:
 
         
 
-app = FirecrawlApp(os.getenv("FIRECRWAL_API_KEY"))
+app = FirecrawlApp(os.getenv("FIRECRWAL_API_KEY"), api_url="http://localhost:3002")
 
 scrape_result = app.scrape_url('firecrawl.dev', formats=['markdown'])
 # print(f"Scraped data is: {scrape_result}\n and it's type is: {type(scrape_result)}")

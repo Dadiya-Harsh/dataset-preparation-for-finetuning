@@ -1,5 +1,7 @@
 import json
 import re
+from bs4 import BeautifulSoup
+import mistune
 import requests
 from typing import List, Optional, Tuple, Dict
 from firecrawl import FirecrawlApp, ScrapeOptions
@@ -15,7 +17,7 @@ FIRECRWAL_API_KEY = os.getenv("FIRECRWAL_API_KEY")
 if not FIRECRWAL_API_KEY:
     raise ValueError("FIRECRWAL_API_KEY is missing in .env file")
 
-app = FirecrawlApp(api_key=FIRECRWAL_API_KEY)
+app = FirecrawlApp(api_url="http://localhost:3002")
 
 # === Utility Functions ===
 
@@ -54,22 +56,34 @@ def clean_markdown_content(markdown: str) -> str:
     if not markdown:
         return ""
 
-    # Remove HTML tags
-    markdown = re.sub(r"<[^>]+>", "", markdown)
+    # Parse markdown into HTML
+    html = mistune.html(markdown)
 
-    # Remove image links
-    markdown = re.sub(r"!\[.*?\]\(.*?\)", "", markdown)
+    # Use BeautifulSoup to strip unwanted tags and scripts
+    soup = BeautifulSoup(html, "lxml")
 
-    # Replace escaped quotes and backslashes
-    markdown = markdown.replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+    # Remove script and style tags
+    for tag in soup(["script", "style", "nav", "footer"]):
+        tag.decompose()
 
-    # Remove Unicode escape sequences like \\xa0
-    markdown = re.sub(r"\\x[a-fA-F0-9]{2}", " ", markdown)
+    # Extract text from paragraphs and code blocks
+    cleaned_text = ""
+    for elem in soup.find_all(True):
+        if elem.name == "code" and elem.parent.name != "pre":
+            # Inline code
+            cleaned_text += f"`{elem.get_text(strip=True)}` "
+        elif elem.name == "pre":
+            # Code block
+            code_block = elem.get_text()
+            cleaned_text += f"\n```{code_block}\n```\n"
+        elif elem.name == "p":
+            # Paragraphs
+            cleaned_text += elem.get_text(strip=True) + "\n\n"
 
-    # Normalize spaces and line breaks
-    markdown = re.sub(r"\s+", " ", markdown).strip()
+    # Final cleanup
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+    return cleaned_text
 
-    return markdown
 
 
 def split_into_paragraphs(text: str, min_length: int = 100) -> List[str]:
@@ -88,7 +102,7 @@ def crawl_website(url: str, max_depth: int = 2, limit: int = 50) -> Optional[Lis
     """
     try:
         print(f"[+] Starting crawl for URL: {url}, Max Depth: {max_depth}, Limit: {limit}")
-        result = app.crawl_url(url, max_depth=max_depth, limit=limit, scrape_options=ScrapeOptions(formats=["markdown"]))
+        result = app.crawl_url(url, max_depth=max_depth, limit=limit, scrape_options=ScrapeOptions(formats=["markdown"], proxy="stealth"))
         
         if not result.success:
             print(f"[!] Crawl job failed: {result.error}")
@@ -152,7 +166,7 @@ def save_instruction_response_pairs(data: List[Tuple[str, str]], output_file: st
 # === Main Execution ===
 
 if __name__ == "__main__":
-    target_url = "https://firecrawl.dev"
+    target_url = "https://langchain-ai.github.io/langgraph/"
     max_depth = 2  # How deep to follow internal links
     page_limit = 50  # Maximum number of pages to crawl
 
@@ -168,7 +182,7 @@ if __name__ == "__main__":
 
         # Step 3: Save to file
         if instruction_response_pairs:
-            save_instruction_response_pairs(instruction_response_pairs, "output.jsonl")
+            save_instruction_response_pairs(instruction_response_pairs, "output_2.jsonl")
         else:
             print("[-] No instruction-response pairs generated.")
 
